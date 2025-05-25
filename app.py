@@ -4,10 +4,10 @@ import pickle
 import numpy as np
 import pandas as pd
 import logging
+import os
 
 app = Flask(__name__)
 
-# Enable logging
 logging.basicConfig(level=logging.INFO)
 
 # Load model and scaler
@@ -33,6 +33,49 @@ feature_columns = [
     "Customer Country", "order date (DateOrders)", "Order Item Quantity", "Market"
 ]
 
+# Categorical columns that have label encoders
+categorical_columns = [
+    "Order Status", "Delivery Status", "Shipping Mode", "Order City", "Order State",
+    "Order Region", "Order Country", "Customer Street", "Customer City",
+    "Customer State", "Customer Country", "Market"
+]
+
+# Date columns
+date_columns = ["shipping date (DateOrders)", "order date (DateOrders)"]
+
+# Load LabelEncoders for categorical columns
+label_encoders = {}
+for col in categorical_columns:
+    le_path = f"le_{col.replace(' ', '_').replace('(', '').replace(')', '')}.pkl"
+    if os.path.exists(le_path):
+        with open(le_path, "rb") as f:
+            label_encoders[col] = pickle.load(f)
+        logging.info(f"Loaded LabelEncoder for column: {col}")
+    else:
+        logging.warning(f"LabelEncoder file not found for column: {col}, expected at {le_path}")
+
+def preprocess_input(df):
+    # 1. Parse date columns to numeric (timestamp)
+    for col in date_columns:
+        df[col] = pd.to_datetime(df[col], errors='coerce')  # convert to datetime, invalid => NaT
+        if df[col].isnull().any():
+            raise ValueError(f"Invalid date format detected in column: {col}")
+        # Convert datetime to timestamp (float seconds since epoch)
+        df[col] = df[col].astype(np.int64) // 10**9  # Convert nanoseconds to seconds (int)
+    
+    # 2. Apply label encoding for categorical columns
+    for col in categorical_columns:
+        if col in df.columns:
+            le = label_encoders.get(col, None)
+            if le is None:
+                raise ValueError(f"LabelEncoder not loaded for column: {col}")
+            try:
+                df[col] = le.transform(df[col].astype(str))
+            except ValueError as ve:
+                # Instead of error, map unseen to -1 or a default value
+                df[col] = df[col].apply(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+
+    return df
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -40,7 +83,6 @@ def predict():
         data = request.get_json(force=True)
         if not data:
             return jsonify({"error": "No JSON payload received"}), 400
-
         if "features" not in data:
             return jsonify({"error": "Missing 'features' key in request"}), 400
 
@@ -51,16 +93,15 @@ def predict():
         if missing:
             return jsonify({"error": f"Missing required features: {missing}"}), 400
 
-        # Ensure correct feature order
-        try:
-            values = [features[col] for col in feature_columns]
-        except KeyError as ke:
-            return jsonify({"error": f"Missing expected feature: {str(ke)}"}), 400
-
+        # Ensure correct feature order and build DataFrame
+        values = [features[col] for col in feature_columns]
         df = pd.DataFrame([values], columns=feature_columns)
 
+        # Preprocess: parse dates and label encode categories
+        df_processed = preprocess_input(df)
+
         # Scale and predict
-        scaled_input = scaler.transform(df)
+        scaled_input = scaler.transform(df_processed)
         prediction = model.predict(scaled_input)
 
         return jsonify({"prediction": prediction.tolist()})
@@ -68,61 +109,50 @@ def predict():
     except ValueError as ve:
         logging.exception("Value error during prediction")
         return jsonify({"error": f"ValueError: {str(ve)}"}), 400
-
     except Exception as e:
         logging.exception("Unhandled exception during prediction")
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
+# Sample input JSON for /test route
+sample_input = {
+   "features": {
+    "shipping date (DateOrders)": "4/1/2016 00:00",
+    "Order Status": "PROCESSING",
+    "Delivery Status": "Late delivery",
+    "Late_delivery_risk": 1,
+    "Shipping Mode": "Standard Class",
+    "Order City": "Los Angeles",
+    "Order State": "California",
+    "Order Region": "West of USA",
+    "Order Country": "Estados Unidos",
+    "Latitude": 18.20397568,
+    "Longitude": -66.37054443,
+    "Customer Street": "8916 Round Zephyr Ridge",
+    "Customer City": "Caguas",
+    "Customer State": "PR",
+    "Customer Country": "Puerto Rico",
+    "order date (DateOrders)": "4/1/2016 00:00",
+    "Order Item Quantity": 1,
+    "Market": "West of USA"
+  }
+}
+
+
+
 @app.route("/test", methods=["GET"])
-def test_sample():
+def test():
     try:
-        sample_input = {
-            "shipping date (DateOrders)": 27148.0,
-            "Order Status": 2.0,
-            "Delivery Status": 0.0,
-            "Late_delivery_risk": 0.0,
-            "Shipping Mode": 3.0,
-            "Order City": 331.0,
-            "Order State": 475.0,
-            "Order Region": 15.0,
-            "Order Country": 70.0,
-            "Latitude": 18.251453,
-            "Longitude": -66.037056,
-            "Customer Street": 3454.0,
-            "Customer City": 66.0,
-            "Customer State": 36.0,
-            "Customer Country": 1.0,
-            "order date (DateOrders)": 5960.0,
-            "Order Item Quantity": 1.0,
-            "Market": 3.0
-        }
-
-        values = [sample_input[col] for col in feature_columns]
+        features = sample_input["features"]
+        values = [features[col] for col in feature_columns]
         df = pd.DataFrame([values], columns=feature_columns)
-        scaled_input = scaler.transform(df)
+        df_processed = preprocess_input(df)
+        scaled_input = scaler.transform(df_processed)
         prediction = model.predict(scaled_input)
-
         return jsonify({"prediction": prediction.tolist()})
-
     except Exception as e:
-        logging.exception("Error in /test route")
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
-
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Endpoint not found"}), 404
-
-
-@app.errorhandler(405)
-def method_not_allowed(e):
-    return jsonify({"error": "Method not allowed"}), 405
-
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({"error": "Internal server error"}), 500
+        logging.exception("Error during test prediction")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
